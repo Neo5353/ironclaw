@@ -165,20 +165,50 @@ impl SetupWizard {
 
     /// Step 1: Database connection.
     async fn step_database(&mut self) -> Result<(), SetupError> {
-        // Determine which backend to use based on compile-time features.
-        // When both features are enabled, prefer the currently configured backend
-        // or default to postgres.
+        // When both features are compiled, let the user choose.
+        // If DATABASE_BACKEND is already set in the environment, respect it.
         #[cfg(all(feature = "postgres", feature = "libsql"))]
         {
-            let backend = std::env::var("DATABASE_BACKEND")
-                .ok()
-                .or_else(|| self.settings.database_backend.clone())
-                .unwrap_or_else(|| "postgres".to_string());
+            // Check if a backend is already pinned via env var
+            let env_backend = std::env::var("DATABASE_BACKEND").ok();
 
-            if backend == "libsql" || backend == "turso" || backend == "sqlite" {
-                return self.step_database_libsql().await;
+            if let Some(ref backend) = env_backend {
+                if backend == "libsql" || backend == "turso" || backend == "sqlite" {
+                    return self.step_database_libsql().await;
+                }
+                return self.step_database_postgres().await;
             }
-            return self.step_database_postgres().await;
+
+            // Interactive selection
+            let pre_selected = self.settings.database_backend.as_deref().map(|b| match b {
+                "libsql" | "turso" | "sqlite" => 1,
+                _ => 0,
+            });
+
+            print_info("Which database backend would you like to use?");
+            println!();
+
+            let options = &[
+                "PostgreSQL  - production-grade, requires a running server",
+                "libSQL      - embedded SQLite, zero dependencies, optional Turso cloud sync",
+            ];
+            let choice =
+                select_one("Select a database backend:", options).map_err(SetupError::Io)?;
+
+            // If the user picked something different from what was pre-selected, clear
+            // stale connection settings so the next step starts fresh.
+            if let Some(prev) = pre_selected
+                && prev != choice
+            {
+                self.settings.database_url = None;
+                self.settings.libsql_path = None;
+                self.settings.libsql_url = None;
+            }
+
+            match choice {
+                1 => return self.step_database_libsql().await,
+                _ => return self.step_database_postgres().await,
+            }
         }
 
         #[cfg(all(feature = "postgres", not(feature = "libsql")))]
