@@ -202,16 +202,10 @@ pub async fn migrate_disk_to_db(
     if session_path.exists() {
         match std::fs::read_to_string(&session_path) {
             Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
-                Ok(value) => {
-                    store
-                        .set_setting(user_id, "nearai.session_token", &value)
-                        .await
-                        .map_err(|e| {
-                            MigrationError::Database(format!(
-                                "Failed to write session to DB: {}",
-                                e
-                            ))
-                        })?;
+                Ok(_value) => {
+                    // NEAR AI session migration removed in local-first refactor
+                    // Previously migrated session tokens to database
+                    tracing::debug!("Skipping NEAR AI session migration (removed)");
                     tracing::info!("Migrated session.json to database");
 
                     rename_to_migrated(&session_path);

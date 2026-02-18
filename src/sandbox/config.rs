@@ -34,7 +34,7 @@ impl Default for SandboxConfig {
             memory_limit_mb: 2048,
             cpu_shares: 1024,
             network_allowlist: default_allowlist(),
-            image: "ghcr.io/nearai/sandbox:latest".to_string(),
+            image: "ghcr.io/openclaw/sandbox:latest".to_string(), // Updated from nearai
             auto_pull_image: true,
             proxy_port: 0,
         }
@@ -166,7 +166,7 @@ pub fn default_credential_mappings() -> Vec<crate::secrets::CredentialMapping> {
     vec![
         CredentialMapping::bearer("OPENAI_API_KEY", "api.openai.com"),
         CredentialMapping::header("ANTHROPIC_API_KEY", "x-api-key", "api.anthropic.com"),
-        CredentialMapping::bearer("NEARAI_API_KEY", "api.near.ai"),
+        // NEARAI_API_KEY removed in local-first refactor
     ]
 }
 

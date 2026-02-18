@@ -1,7 +1,7 @@
 //! Shared retry helpers for LLM providers.
 //!
 //! Provides exponential backoff with jitter and retryable status classification
-//! used by both `NearAiProvider` and `NearAiChatProvider`.
+//! used by LLM providers for handling transient errors.
 
 use std::time::Duration;
 

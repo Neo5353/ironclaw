@@ -165,11 +165,11 @@ env-var mode or skipped secrets.
 
 | Provider | Auth Method | Secret Name | Env Var |
 |----------|-------------|-------------|---------|
-| NEAR AI | Browser OAuth | (session token) | `NEARAI_SESSION_TOKEN` |
+| Ollama (default) | None | - | - |
 | Anthropic | API key | `anthropic_api_key` | `ANTHROPIC_API_KEY` |
 | OpenAI | API key | `openai_api_key` | `OPENAI_API_KEY` |
-| Ollama | None | - | - |
 | OpenAI-compatible | Optional API key | `llm_compatible_api_key` | `LLM_API_KEY` |
+| Tinfoil | API key | `tinfoil_api_key` | `TINFOIL_API_KEY` |
 
 **API-key providers** (`setup_api_key_provider`):
 1. Check env var → if set, ask to reuse, persist to secrets store
@@ -177,9 +177,9 @@ env-var mode or skipped secrets.
 3. Store encrypted in secrets via `init_secrets_context()`
 4. **Cache key in `self.llm_api_key`** for model fetching in Step 4
 
-**NEAR AI** (`setup_nearai`):
-- Calls `session_manager.ensure_authenticated()` which opens browser
-- Session token saved to `~/.ironclaw/session.json`
+**NEAR AI** (removed in local-first refactor):
+- NEAR AI setup function removed
+- Local providers (Ollama) require no authentication
 
 **`self.llm_api_key` caching:** The wizard caches the API key as
 `Option<SecretString>` so that Step 4 (model fetching) and Step 5
@@ -221,11 +221,9 @@ key first, then falls back to the standard env var.
 **Flow:**
 1. Ask "Enable semantic search?" (default: yes)
 2. Detect available providers:
-   - NEAR AI: if backend is `nearai` OR valid session exists
    - OpenAI: if `OPENAI_API_KEY` in env OR (backend is `openai` AND cached key)
-3. If both available → let user choose
-4. If only one → use it
-5. If neither → disable embeddings
+3. If OpenAI available → use it
+4. If not available → disable embeddings (NEAR AI removed)
 
 **Default model:** `text-embedding-3-small` (for both providers)
 
@@ -303,11 +301,12 @@ LLM_BACKEND="openai_compatible"
 LLM_BASE_URL="http://my-vllm:8000/v1"
 ```
 
-Or for PostgreSQL + NEAR AI:
+Or for PostgreSQL + Anthropic:
 ```env
 DATABASE_BACKEND="postgres"
 DATABASE_URL="postgres://user:pass@localhost/ironclaw"
-LLM_BACKEND="nearai"
+LLM_BACKEND="anthropic"
+ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
 Or for Ollama:
@@ -328,10 +327,10 @@ keyed by `(user_id, key)`. Written by `set_all_settings()`.
 Settings are serialized via `Settings::to_db_map()` as dotted paths:
 ```
 database_backend = "libsql"
-llm_backend = "nearai"
-selected_model = "anthropic/claude-sonnet-4-5"
+llm_backend = "ollama"
+selected_model = "llama3.1"
 embeddings.enabled = "true"
-embeddings.provider = "nearai"
+embeddings.provider = "openai"
 channels.http_enabled = "true"
 heartbeat.enabled = "true"
 heartbeat.interval_secs = "300"
@@ -385,7 +384,7 @@ pub struct Settings {
     pub secrets_master_key_source: KeySource, // Keychain | Env | None
 
     // Step 3: Inference
-    pub llm_backend: Option<String>,         // "nearai" | "anthropic" | "openai" | "ollama" | "openai_compatible"
+    pub llm_backend: Option<String>,         // "ollama" | "anthropic" | "openai" | "openai_compatible" | "tinfoil"
     pub ollama_base_url: Option<String>,
     pub openai_compatible_base_url: Option<String>,
 

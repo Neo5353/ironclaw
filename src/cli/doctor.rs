@@ -16,12 +16,13 @@ pub async fn run_doctor_command() -> anyhow::Result<()> {
 
     // ── Configuration checks ──────────────────────────────────
 
-    check(
-        "NEAR AI session",
-        check_nearai_session().await,
-        &mut passed,
-        &mut failed,
-    );
+    // NEAR AI session check removed in local-first refactor
+    // check(
+    //     "LLM Backend",
+    //     check_llm_backend().await,
+    //     &mut passed,
+    //     &mut failed,
+    // );
 
     check(
         "Database backend",
@@ -103,28 +104,10 @@ enum CheckResult {
     Skip(String),
 }
 
-async fn check_nearai_session() -> CheckResult {
-    // Check if session file exists
-    let session_path = crate::llm::session::default_session_path();
-    if !session_path.exists() {
-        // Check for API key mode
-        if std::env::var("NEARAI_API_KEY").is_ok() {
-            return CheckResult::Pass("API key configured".into());
-        }
-        return CheckResult::Fail(format!(
-            "session file not found at {}. Run `ironclaw onboard`",
-            session_path.display()
-        ));
-    }
-
-    // Verify the session file is readable and non-empty
-    match std::fs::read_to_string(&session_path) {
-        Ok(content) if content.trim().is_empty() => {
-            CheckResult::Fail("session file is empty".into())
-        }
-        Ok(_) => CheckResult::Pass(format!("session found ({})", session_path.display())),
-        Err(e) => CheckResult::Fail(format!("cannot read session file: {e}")),
-    }
+// NEAR AI session check function removed in local-first refactor
+#[allow(dead_code)]
+async fn _check_nearai_session_removed() -> CheckResult {
+    CheckResult::Skip("NEAR AI checks removed in local-first refactor".to_string())
 }
 
 async fn check_database() -> CheckResult {
@@ -269,13 +252,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn check_nearai_session_does_not_panic() {
-        let result = check_nearai_session().await;
-        match result {
-            CheckResult::Pass(_) | CheckResult::Fail(_) | CheckResult::Skip(_) => {}
-        }
-    }
+    // NEAR AI session test removed in local-first refactor
 
     fn format_result(r: &CheckResult) -> String {
         match r {

@@ -21,7 +21,7 @@ use tokio_postgres::NoTls;
 use crate::channels::wasm::{
     ChannelCapabilitiesFile, available_channel_names, install_bundled_channel,
 };
-use crate::llm::{SessionConfig, SessionManager};
+use crate::llm::SessionManager;
 use crate::secrets::{SecretsCrypto, SecretsStore};
 use crate::settings::{KeySource, Settings};
 use crate::setup::channels::{
@@ -602,7 +602,6 @@ impl SetupWizard {
         // Show current provider if already configured
         if let Some(ref current) = self.settings.llm_backend {
             let display = match current.as_str() {
-                "nearai" => "NEAR AI",
                 "anthropic" => "Anthropic (Claude)",
                 "openai" => "OpenAI",
                 "ollama" => "Ollama (local)",
@@ -614,17 +613,16 @@ impl SetupWizard {
 
             let is_known = matches!(
                 current.as_str(),
-                "nearai" | "anthropic" | "openai" | "ollama" | "openai_compatible"
+                "anthropic" | "openai" | "ollama" | "openai_compatible"
             );
 
             if is_known && confirm("Keep current provider?", true).map_err(SetupError::Io)? {
                 // Still run the auth sub-flow in case they need to update keys
                 match current.as_str() {
-                    "nearai" => return self.setup_nearai().await,
-                    "anthropic" => return self.setup_anthropic().await,
-                    "openai" => return self.setup_openai().await,
                     "ollama" => return self.setup_ollama(),
                     "openai_compatible" => return self.setup_openai_compatible().await,
+                    "anthropic" => return self.setup_anthropic().await,
+                    "openai" => return self.setup_openai().await,
                     _ => {
                         return Err(SetupError::Config(format!(
                             "Unhandled provider: {}",
@@ -642,72 +640,51 @@ impl SetupWizard {
             }
         }
 
-        print_info("Select your inference provider:");
+        print_info("Select your inference provider (local/self-hosted recommended):");
         println!();
 
         let options = &[
-            "NEAR AI          - multi-model access via NEAR account",
+            "Ollama           - local models, no API key needed [RECOMMENDED]",
             "Anthropic        - Claude models (direct API key)",
             "OpenAI           - GPT models (direct API key)",
-            "Ollama           - local models, no API key needed",
             "OpenAI-compatible - custom endpoint (vLLM, LiteLLM, Together, etc.)",
         ];
 
         let choice = select_one("Provider:", options).map_err(SetupError::Io)?;
 
         match choice {
-            0 => self.setup_nearai().await?,
+            0 => self.setup_ollama()?,
             1 => self.setup_anthropic().await?,
             2 => self.setup_openai().await?,
-            3 => self.setup_ollama()?,
-            4 => self.setup_openai_compatible().await?,
+            3 => self.setup_openai_compatible().await?,
             _ => return Err(SetupError::Config("Invalid provider selection".to_string())),
         }
 
         Ok(())
     }
 
-    /// NEAR AI provider setup (extracted from the old step_authentication).
-    async fn setup_nearai(&mut self) -> Result<(), SetupError> {
-        self.settings.llm_backend = Some("nearai".to_string());
+    // setup_nearai removed - NEAR AI support removed in local-first refactor
 
-        // Check if we already have a session
-        if let Some(ref session) = self.session_manager
-            && session.has_token().await
-        {
-            print_info("Existing session found. Validating...");
-            match session.ensure_authenticated().await {
-                Ok(()) => {
-                    print_success("NEAR AI session valid");
-                    return Ok(());
-                }
-                Err(e) => {
-                    print_info(&format!("Session invalid: {}. Re-authenticating...", e));
-                }
+    /// Anthropic provider setup: API key or OAuth token (from Claude Pro/Max subscription).
+    async fn setup_anthropic(&mut self) -> Result<(), SetupError> {
+        use crate::config::ClaudeCodeConfig;
+
+        // Check if an OAuth token is available from Claude Code credentials
+        let has_oauth = ClaudeCodeConfig::extract_oauth_token().is_some();
+
+        if has_oauth {
+            print_info("Found Claude OAuth token from your Claude subscription!");
+            let options = &[
+                "Use OAuth token (from Claude Pro/Max/Team subscription - no API key needed)",
+                "Use API key (from console.anthropic.com)",
+            ];
+            let choice = select_one("Authentication method:", options).map_err(SetupError::Io)?;
+
+            if choice == 0 {
+                return self.setup_anthropic_oauth().await;
             }
         }
 
-        // Create session manager if we don't have one
-        let session = if let Some(ref s) = self.session_manager {
-            Arc::clone(s)
-        } else {
-            let config = SessionConfig::default();
-            Arc::new(SessionManager::new(config))
-        };
-
-        // Trigger authentication flow
-        session
-            .ensure_authenticated()
-            .await
-            .map_err(|e| SetupError::Auth(e.to_string()))?;
-
-        self.session_manager = Some(session);
-        print_success("NEAR AI configured");
-        Ok(())
-    }
-
-    /// Anthropic provider setup: collect API key and store in secrets.
-    async fn setup_anthropic(&mut self) -> Result<(), SetupError> {
         self.setup_api_key_provider(
             "anthropic",
             "ANTHROPIC_API_KEY",
@@ -716,6 +693,35 @@ impl SetupWizard {
             "https://console.anthropic.com/settings/keys",
         )
         .await
+    }
+
+    /// Anthropic OAuth setup: use token from Claude Code credentials (Pro/Max/Team subscription).
+    async fn setup_anthropic_oauth(&mut self) -> Result<(), SetupError> {
+        use crate::config::ClaudeCodeConfig;
+
+        let token = ClaudeCodeConfig::extract_oauth_token().ok_or_else(|| {
+            SetupError::Config(
+                "OAuth token not found. Make sure you're logged into Claude Code (`claude login`).".to_string(),
+            )
+        })?;
+
+        self.settings.llm_backend = Some("anthropic".to_string());
+        self.settings.selected_model = None;
+
+        // Store the OAuth token as the API key — Anthropic's API accepts OAuth tokens
+        // with the same Bearer auth header
+        let key = SecretString::from(token);
+        if let Ok(ctx) = self.init_secrets_context().await {
+            ctx.save_secret("llm_anthropic_api_key", &key)
+                .await
+                .map_err(|e| SetupError::Config(format!("Failed to save OAuth token: {e}")))?;
+            print_success("OAuth token saved (encrypted)");
+        }
+
+        self.llm_api_key = Some(key);
+        print_info("Note: OAuth tokens expire every 8-12 hours. IronClaw will re-read from your Claude credentials automatically.");
+        print_success("Anthropic configured via OAuth (Claude subscription)");
+        Ok(())
     }
 
     /// OpenAI provider setup: collect API key and store in secrets.
@@ -895,7 +901,7 @@ impl SetupWizard {
             }
         }
 
-        let backend = self.settings.llm_backend.as_deref().unwrap_or("nearai");
+        let backend = self.settings.llm_backend.as_deref().unwrap_or("ollama");
 
         match backend {
             "anthropic" => {
@@ -937,27 +943,9 @@ impl SetupWizard {
                 print_success(&format!("Selected {}", model_id));
             }
             _ => {
-                // NEAR AI: use existing provider list_models()
-                let fetched = self.fetch_nearai_models().await;
-                let default_models: Vec<(String, String)> = vec![
-                    (
-                        "fireworks::accounts/fireworks/models/llama4-maverick-instruct-basic"
-                            .into(),
-                        "Llama 4 Maverick (default, fast)".into(),
-                    ),
-                    (
-                        "anthropic::claude-sonnet-4-20250514".into(),
-                        "Claude Sonnet 4 (best quality)".into(),
-                    ),
-                    ("openai::gpt-4o".into(), "GPT-4o".into()),
-                ];
-
-                let models = if fetched.is_empty() {
-                    default_models
-                } else {
-                    fetched.iter().map(|m| (m.clone(), m.clone())).collect()
-                };
-                self.select_from_model_list(&models)?;
+                // For local providers, just use the default model configured in the provider setup
+                print_info("Using default model configured for the selected provider.");
+                // No additional model selection needed for local providers
             }
         }
 
@@ -995,65 +983,7 @@ impl SetupWizard {
         Ok(())
     }
 
-    /// Fetch available models from the NEAR AI API.
-    async fn fetch_nearai_models(&self) -> Vec<String> {
-        let session = match self.session_manager {
-            Some(ref s) => Arc::clone(s),
-            None => return vec![],
-        };
-
-        use crate::config::LlmConfig;
-        use crate::llm::create_llm_provider;
-
-        let base_url = std::env::var("NEARAI_BASE_URL")
-            .unwrap_or_else(|_| "https://private.near.ai".to_string());
-        let auth_base_url = std::env::var("NEARAI_AUTH_URL")
-            .unwrap_or_else(|_| "https://private.near.ai".to_string());
-
-        let config = LlmConfig {
-            backend: crate::config::LlmBackend::NearAi,
-            nearai: crate::config::NearAiConfig {
-                model: "dummy".to_string(),
-                cheap_model: None,
-                base_url,
-                auth_base_url,
-                session_path: crate::llm::session::default_session_path(),
-                api_mode: crate::config::NearAiApiMode::Responses,
-                api_key: None,
-                fallback_model: None,
-                max_retries: 3,
-                circuit_breaker_threshold: None,
-                circuit_breaker_recovery_secs: 30,
-                response_cache_enabled: false,
-                response_cache_ttl_secs: 3600,
-                response_cache_max_entries: 1000,
-                failover_cooldown_secs: 300,
-                failover_cooldown_threshold: 3,
-            },
-            openai: None,
-            anthropic: None,
-            ollama: None,
-            openai_compatible: None,
-            tinfoil: None,
-        };
-
-        match create_llm_provider(&config, session) {
-            Ok(provider) => match provider.list_models().await {
-                Ok(models) => models,
-                Err(e) => {
-                    print_info(&format!("Could not fetch models: {}. Using defaults.", e));
-                    vec![]
-                }
-            },
-            Err(e) => {
-                print_info(&format!(
-                    "Could not initialize provider: {}. Using defaults.",
-                    e
-                ));
-                vec![]
-            }
-        }
-    }
+    // fetch_nearai_models removed - NEAR AI support removed in local-first refactor
 
     /// Step 5: Embeddings configuration.
     fn step_embeddings(&mut self) -> Result<(), SetupError> {
@@ -1066,10 +996,9 @@ impl SetupWizard {
             return Ok(());
         }
 
-        let backend = self.settings.llm_backend.as_deref().unwrap_or("nearai");
+        let backend = self.settings.llm_backend.as_deref().unwrap_or("ollama");
         let has_openai_key = std::env::var("OPENAI_API_KEY").is_ok()
             || (backend == "openai" && self.llm_api_key.is_some());
-        let has_nearai = backend == "nearai" || self.session_manager.is_some();
 
         // If the LLM backend is OpenAI and we already have a key, default to OpenAI embeddings
         if backend == "openai" && has_openai_key {
@@ -1080,37 +1009,19 @@ impl SetupWizard {
             return Ok(());
         }
 
-        // If no NEAR AI session and no OpenAI key, only OpenAI is viable
-        if !has_nearai && !has_openai_key {
-            print_info("No NEAR AI session or OpenAI key found for embeddings.");
+        // If no OpenAI key, embeddings are disabled
+        if !has_openai_key {
+            print_info("No OpenAI key found for embeddings.");
             print_info("Set OPENAI_API_KEY in your environment to enable embeddings.");
             self.settings.embeddings.enabled = false;
             return Ok(());
         }
 
-        let mut options = Vec::new();
-        if has_nearai {
-            options.push("NEAR AI (uses same auth, no extra cost)");
-        }
-        options.push("OpenAI (requires API key)");
-
+        let options = vec!["OpenAI embeddings (text-embedding-3-small)", "Skip embeddings"];
         let choice = select_one("Select embeddings provider:", &options).map_err(SetupError::Io)?;
 
-        // Map choice back to provider name
-        let provider = if has_nearai && choice == 0 {
-            "nearai"
-        } else {
-            "openai"
-        };
-
-        match provider {
-            "nearai" => {
-                self.settings.embeddings.enabled = true;
-                self.settings.embeddings.provider = "nearai".to_string();
-                self.settings.embeddings.model = "text-embedding-3-small".to_string();
-                print_success("Embeddings enabled via NEAR AI");
-            }
-            _ => {
+        match choice {
+            0 => {
                 if !has_openai_key {
                     print_info("OPENAI_API_KEY not set in environment.");
                     print_info("Add it to your .env file or environment to enable embeddings.");
@@ -1120,6 +1031,11 @@ impl SetupWizard {
                 self.settings.embeddings.model = "text-embedding-3-small".to_string();
                 print_success("Embeddings configured for OpenAI");
             }
+            1 => {
+                self.settings.embeddings.enabled = false;
+                print_success("Embeddings disabled");
+            }
+            _ => return Err(SetupError::Config("Invalid embeddings selection".to_string())),
         }
 
         Ok(())
@@ -1593,7 +1509,7 @@ impl SetupWizard {
 
         if let Some(ref provider) = self.settings.llm_backend {
             let display = match provider.as_str() {
-                "nearai" => "NEAR AI",
+                // NEAR AI removed in local-first refactor
                 "anthropic" => "Anthropic",
                 "openai" => "OpenAI",
                 "ollama" => "Ollama",

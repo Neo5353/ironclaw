@@ -41,7 +41,7 @@ pub struct Settings {
     pub secrets_master_key_source: KeySource,
 
     // === Step 3: Inference Provider ===
-    /// LLM backend: "nearai", "anthropic", "openai", "ollama", "openai_compatible".
+    /// LLM backend: "ollama", "anthropic", "openai", "openai_compatible", "tinfoil" (nearai removed).
     #[serde(default)]
     pub llm_backend: Option<String>,
 
@@ -119,7 +119,7 @@ pub struct EmbeddingsSettings {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Provider to use: "openai" or "nearai".
+    /// Provider to use: "openai" (nearai removed in local-first refactor).
     #[serde(default = "default_embeddings_provider")]
     pub provider: String,
 

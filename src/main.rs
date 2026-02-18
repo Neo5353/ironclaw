@@ -25,9 +25,8 @@ use ironclaw::{
     extensions::ExtensionManager,
     hooks::HookRegistry,
     llm::{
-        CachedProvider, CircuitBreakerConfig, CircuitBreakerProvider, CooldownConfig,
-        FailoverProvider, LlmProvider, ResponseCacheConfig, SessionConfig,
-        create_cheap_llm_provider, create_llm_provider, create_llm_provider_with_config,
+        LlmProvider, SessionConfig,
+        create_cheap_llm_provider, create_llm_provider,
         create_session_manager,
     },
     orchestrator::{
@@ -42,7 +41,7 @@ use ironclaw::{
         mcp::{McpClient, McpSessionManager, config::load_mcp_servers_from_db, is_authenticated},
         wasm::{WasmToolLoader, WasmToolRuntime, load_dev_tools},
     },
-    workspace::{EmbeddingProvider, NearAiEmbeddings, OpenAiEmbeddings, Workspace},
+    workspace::{EmbeddingProvider, OpenAiEmbeddings, Workspace},
 };
 
 #[cfg(feature = "libsql")]
@@ -100,23 +99,10 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            // Set up embeddings if available
-            let session = ironclaw::llm::create_session_manager(ironclaw::llm::SessionConfig {
-                auth_base_url: config.llm.nearai.auth_base_url.clone(),
-                session_path: config.llm.nearai.session_path.clone(),
-            })
-            .await;
-
+            // Set up embeddings if available (OpenAI only after removing NEAR AI)
             let embeddings: Option<Arc<dyn ironclaw::workspace::EmbeddingProvider>> =
                 if config.embeddings.enabled {
                     match config.embeddings.provider.as_str() {
-                        "nearai" => Some(Arc::new(
-                            ironclaw::workspace::NearAiEmbeddings::new(
-                                &config.llm.nearai.base_url,
-                                session,
-                            )
-                            .with_model(&config.embeddings.model, 1536),
-                        )),
                         _ => {
                             if let Some(api_key) = config.embeddings.openai_api_key() {
                                 let dim = match config.embeddings.model.as_str() {
@@ -323,12 +309,9 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     };
 
-    // Initialize session manager and authenticate before channel setup
-    let session_config = SessionConfig {
-        auth_base_url: config.llm.nearai.auth_base_url.clone(),
-        session_path: config.llm.nearai.session_path.clone(),
-    };
-    let session = create_session_manager(session_config).await;
+    // For local providers, no session manager needed
+    // Create a dummy session manager for compatibility
+    let session = create_session_manager(SessionConfig::default()).await;
 
     // Initialize tracing
     let env_filter = EnvFilter::try_from_default_env()
@@ -530,14 +513,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Session-based auth is only needed for NEAR AI backend without an API key.
-    // Do this after DB-backed config reload so provider selection from onboarding
-    // is respected (e.g. OpenAI/OpenAI-compatible should not trigger NEAR auth).
-    if config.llm.backend == ironclaw::config::LlmBackend::NearAi
-        && config.llm.nearai.api_key.is_none()
-    {
-        session.ensure_authenticated().await?;
-    }
+    // Local providers don't require authentication
+    // Authentication logic removed with NEAR AI
 
     // Start managed tunnel if configured and no static URL is already set.
     //
@@ -596,77 +573,16 @@ async fn main() -> anyhow::Result<()> {
         };
 
     // Initialize LLM provider (clone session so we can reuse it for embeddings)
-    let llm = create_llm_provider(&config.llm, session.clone())?;
+    let llm = create_llm_provider(&config.llm, Some(session.clone()))?;
     tracing::info!("LLM provider initialized: {}", llm.model_name());
 
-    // Wrap in failover if a fallback model is configured
-    let llm: Arc<dyn LlmProvider> =
-        if let Some(fallback_model) = config.llm.nearai.fallback_model.as_ref() {
-            if fallback_model == &config.llm.nearai.model {
-                tracing::warn!(
-                    "fallback_model is the same as primary model, failover may not be effective"
-                );
-            }
-            let mut fallback_config = config.llm.nearai.clone();
-            fallback_config.model = fallback_model.clone();
-            let fallback = create_llm_provider_with_config(&fallback_config, session.clone())?;
-            tracing::info!(
-                primary = %llm.model_name(),
-                fallback = %fallback.model_name(),
-                "LLM failover enabled"
-            );
-            let cooldown_config = CooldownConfig {
-                cooldown_duration: std::time::Duration::from_secs(
-                    config.llm.nearai.failover_cooldown_secs,
-                ),
-                failure_threshold: config.llm.nearai.failover_cooldown_threshold,
-            };
-            Arc::new(FailoverProvider::with_cooldown(
-                vec![llm, fallback],
-                cooldown_config,
-            )?)
-        } else {
-            llm
-        };
+    // For local providers, failover is not typically needed
+    let llm: Arc<dyn LlmProvider> = llm;
 
-    // Wrap in circuit breaker if configured
-    let llm: Arc<dyn LlmProvider> =
-        if let Some(threshold) = config.llm.nearai.circuit_breaker_threshold {
-            let cb_config = CircuitBreakerConfig {
-                failure_threshold: threshold,
-                recovery_timeout: std::time::Duration::from_secs(
-                    config.llm.nearai.circuit_breaker_recovery_secs,
-                ),
-                ..CircuitBreakerConfig::default()
-            };
-            tracing::info!(
-                threshold,
-                recovery_secs = config.llm.nearai.circuit_breaker_recovery_secs,
-                "LLM circuit breaker enabled"
-            );
-            Arc::new(CircuitBreakerProvider::new(llm, cb_config))
-        } else {
-            llm
-        };
-
-    // Wrap in response cache if configured
-    let llm: Arc<dyn LlmProvider> = if config.llm.nearai.response_cache_enabled {
-        let rc_config = ResponseCacheConfig {
-            ttl: std::time::Duration::from_secs(config.llm.nearai.response_cache_ttl_secs),
-            max_entries: config.llm.nearai.response_cache_max_entries,
-        };
-        tracing::info!(
-            ttl_secs = config.llm.nearai.response_cache_ttl_secs,
-            max_entries = config.llm.nearai.response_cache_max_entries,
-            "LLM response cache enabled"
-        );
-        Arc::new(CachedProvider::new(llm, rc_config))
-    } else {
-        llm
-    };
+    // Local providers typically don't need circuit breakers or response caching
 
     // Initialize cheap LLM provider for lightweight tasks (heartbeat, evaluation)
-    let cheap_llm = create_cheap_llm_provider(&config.llm, session.clone())?;
+    let cheap_llm = create_cheap_llm_provider(&config.llm, Some(session.clone()))?;
     if let Some(ref cheap) = cheap_llm {
         tracing::info!("Cheap LLM provider initialized: {}", cheap.model_name());
     }
@@ -683,16 +599,7 @@ async fn main() -> anyhow::Result<()> {
     // Create embeddings provider if configured
     let embeddings: Option<Arc<dyn EmbeddingProvider>> = if config.embeddings.enabled {
         match config.embeddings.provider.as_str() {
-            "nearai" => {
-                tracing::info!(
-                    "Embeddings enabled via NEAR AI (model: {})",
-                    config.embeddings.model
-                );
-                Some(Arc::new(
-                    NearAiEmbeddings::new(&config.llm.nearai.base_url, session.clone())
-                        .with_model(&config.embeddings.model, 1536),
-                ))
-            }
+            // NEAR AI embeddings removed in local-first refactor
             _ => {
                 // Default to OpenAI for unknown providers
                 if let Some(api_key) = config.embeddings.openai_api_key() {
@@ -1469,16 +1376,11 @@ fn check_onboard_needed() -> Option<&'static str> {
         return Some("Database not configured");
     }
 
-    // First run (onboarding never completed and no session).
-    // Reads NEARAI_API_KEY env var directly because this function runs
-    // before Config is loaded -- Config::from_env() may fail without a
-    // database URL, which is what triggers onboarding in the first place.
-    if std::env::var("NEARAI_API_KEY").is_err() {
-        let settings = ironclaw::settings::Settings::load();
-        let session_path = ironclaw::llm::session::default_session_path();
-        if !settings.onboard_completed && !session_path.exists() {
-            return Some("First run");
-        }
+    // First run (onboarding never completed).
+    // For local-first setup, just check if onboarding was completed.
+    let settings = ironclaw::settings::Settings::load();
+    if !settings.onboard_completed {
+        return Some("First run");
     }
 
     None
