@@ -1,12 +1,15 @@
 //! Bundled hook implementations and declarative hook registration.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use regex::Regex;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use crate::hooks::{
     Hook, HookContext, HookError, HookEvent, HookFailureMode, HookOutcome, HookPoint, HookRegistry,
@@ -15,6 +18,7 @@ use crate::hooks::{
 const DEFAULT_RULE_PRIORITY: u32 = 100;
 const DEFAULT_WEBHOOK_PRIORITY: u32 = 300;
 const DEFAULT_WEBHOOK_TIMEOUT_MS: u64 = 2000;
+const DEFAULT_WEBHOOK_MAX_IN_FLIGHT: usize = 32;
 const MAX_HOOK_TIMEOUT_MS: u64 = 30_000;
 
 const ALL_HOOK_POINTS: [HookPoint; 6] = [
@@ -47,6 +51,25 @@ pub enum HookBundleError {
 
     #[error("Outbound webhook hook '{hook}' has invalid url: {url}")]
     InvalidWebhookUrl { hook: String, url: String },
+
+    #[error("Outbound webhook hook '{hook}' must use https, got '{scheme}'")]
+    InvalidWebhookScheme { hook: String, scheme: String },
+
+    #[error("Outbound webhook hook '{hook}' cannot target host '{host}'")]
+    ForbiddenWebhookHost { hook: String, host: String },
+
+    #[error("Outbound webhook hook '{hook}' has invalid header '{header}': {reason}")]
+    InvalidWebhookHeader {
+        hook: String,
+        header: String,
+        reason: String,
+    },
+
+    #[error("Outbound webhook hook '{hook}' cannot set restricted header '{header}'")]
+    ForbiddenWebhookHeader { hook: String, header: String },
+
+    #[error("Outbound webhook hook '{hook}' max_in_flight must be at least 1")]
+    InvalidWebhookMaxInFlight { hook: String },
 }
 
 /// A declarative hook bundle loaded from workspace files or extension capabilities.
@@ -221,6 +244,9 @@ pub struct OutboundWebhookConfig {
     /// Optional priority override (lower runs first).
     #[serde(default)]
     pub priority: Option<u32>,
+    /// Optional max number of concurrent in-flight deliveries.
+    #[serde(default)]
+    pub max_in_flight: Option<usize>,
 }
 
 /// Built-in audit trail hook that logs lifecycle events.
@@ -260,6 +286,7 @@ struct CompiledReplacement {
 }
 
 /// Runtime hook compiled from [`HookRuleConfig`].
+#[derive(Debug)]
 struct RuleHook {
     name: String,
     points: Vec<HookPoint>,
@@ -308,6 +335,18 @@ impl RuleHook {
                 regex: compiled,
                 replacement: replacement.replacement,
             });
+        }
+
+        if when_regex.is_some()
+            && config.reject_reason.is_none()
+            && replacements.is_empty()
+            && config.prepend.as_deref().is_none()
+            && config.append.as_deref().is_none()
+        {
+            tracing::warn!(
+                hook = %scoped_name,
+                "Rule hook has a guard but no actions; it will always no-op"
+            );
         }
 
         let hook = Self {
@@ -387,13 +426,15 @@ impl Hook for RuleHook {
 }
 
 /// Runtime outbound webhook hook.
+#[derive(Debug)]
 struct OutboundWebhookHook {
     name: String,
     points: Vec<HookPoint>,
     client: reqwest::Client,
     url: String,
-    headers: HashMap<String, String>,
+    headers: HeaderMap,
     timeout: Duration,
+    semaphore: Arc<Semaphore>,
 }
 
 impl OutboundWebhookHook {
@@ -407,30 +448,35 @@ impl OutboundWebhookHook {
             return Err(HookBundleError::MissingHookPoints { hook: scoped_name });
         }
 
-        if reqwest::Url::parse(&config.url).is_err() {
-            return Err(HookBundleError::InvalidWebhookUrl {
-                hook: scoped_name,
-                url: config.url,
-            });
-        }
+        let url = validate_webhook_url(&scoped_name, &config.url)?;
+        let headers = validate_webhook_headers(&scoped_name, &config.headers)?;
 
         let timeout = timeout_from_ms(
             config.timeout_ms.or(Some(DEFAULT_WEBHOOK_TIMEOUT_MS)),
             &scoped_name,
         )?;
 
+        let max_in_flight = config
+            .max_in_flight
+            .unwrap_or(DEFAULT_WEBHOOK_MAX_IN_FLIGHT);
+        if max_in_flight == 0 {
+            return Err(HookBundleError::InvalidWebhookMaxInFlight { hook: scoped_name });
+        }
+
         let client = reqwest::Client::builder()
             .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| HookBundleError::InvalidFormat(e.to_string()))?;
 
         let hook = Self {
-            name: format!("{}::{}", source, config.name),
+            name: scoped_name,
             points: config.points,
             client,
-            url: config.url,
-            headers: config.headers,
+            url: url.to_string(),
+            headers,
             timeout,
+            semaphore: Arc::new(Semaphore::new(max_in_flight)),
         };
 
         Ok((hook, config.priority.unwrap_or(DEFAULT_WEBHOOK_PRIORITY)))
@@ -442,8 +488,33 @@ struct OutboundWebhookPayload {
     hook: String,
     point: String,
     timestamp: String,
-    event: serde_json::Value,
-    metadata: serde_json::Value,
+    event: OutboundWebhookEventSummary,
+    metadata_present: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum OutboundWebhookEventSummary {
+    Inbound {
+        channel: String,
+        has_thread_id: bool,
+        content_length: usize,
+    },
+    ToolCall {
+        tool_name: String,
+        context: String,
+        parameter_count: usize,
+    },
+    Outbound {
+        channel: String,
+        has_thread_id: bool,
+        content_length: usize,
+    },
+    SessionStart,
+    SessionEnd,
+    ResponseTransform {
+        response_length: usize,
+    },
 }
 
 #[async_trait]
@@ -469,8 +540,19 @@ impl Hook for OutboundWebhookHook {
             hook: self.name.clone(),
             point: event.hook_point().as_str().to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
-            event: serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
-            metadata: ctx.metadata.clone(),
+            event: summarize_webhook_event(event),
+            metadata_present: !ctx.metadata.is_null(),
+        };
+
+        let permit = match self.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(
+                    hook = %self.name,
+                    "Dropping outbound webhook delivery due to concurrency limit"
+                );
+                return Ok(HookOutcome::ok());
+            }
         };
 
         let client = self.client.clone();
@@ -479,11 +561,18 @@ impl Hook for OutboundWebhookHook {
         let hook_name = self.name.clone();
 
         tokio::spawn(async move {
-            let mut request = client.post(url).json(&payload);
+            let _permit = permit;
 
-            for (name, value) in headers {
-                request = request.header(name, value);
+            if let Err(err) = validate_webhook_target_runtime(&url).await {
+                tracing::warn!(
+                    hook = %hook_name,
+                    error = %err,
+                    "Outbound webhook target blocked by runtime network policy"
+                );
+                return;
             }
+
+            let request = client.post(url).headers(headers).json(&payload);
 
             if let Err(err) = request.send().await {
                 tracing::warn!(hook = %hook_name, error = %err, "Outbound webhook delivery failed");
@@ -492,6 +581,225 @@ impl Hook for OutboundWebhookHook {
 
         Ok(HookOutcome::ok())
     }
+}
+
+fn summarize_webhook_event(event: &HookEvent) -> OutboundWebhookEventSummary {
+    match event {
+        HookEvent::Inbound {
+            channel,
+            content,
+            thread_id,
+            ..
+        } => OutboundWebhookEventSummary::Inbound {
+            channel: channel.clone(),
+            has_thread_id: thread_id.is_some(),
+            content_length: content.len(),
+        },
+        HookEvent::ToolCall {
+            tool_name,
+            context,
+            parameters,
+            ..
+        } => OutboundWebhookEventSummary::ToolCall {
+            tool_name: tool_name.clone(),
+            context: context.clone(),
+            parameter_count: match parameters {
+                serde_json::Value::Object(map) => map.len(),
+                serde_json::Value::Null => 0,
+                _ => 1,
+            },
+        },
+        HookEvent::Outbound {
+            channel,
+            content,
+            thread_id,
+            ..
+        } => OutboundWebhookEventSummary::Outbound {
+            channel: channel.clone(),
+            has_thread_id: thread_id.is_some(),
+            content_length: content.len(),
+        },
+        HookEvent::SessionStart { .. } => OutboundWebhookEventSummary::SessionStart,
+        HookEvent::SessionEnd { .. } => OutboundWebhookEventSummary::SessionEnd,
+        HookEvent::ResponseTransform { response, .. } => {
+            OutboundWebhookEventSummary::ResponseTransform {
+                response_length: response.len(),
+            }
+        }
+    }
+}
+
+fn validate_webhook_url(hook_name: &str, url: &str) -> Result<reqwest::Url, HookBundleError> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| HookBundleError::InvalidWebhookUrl {
+        hook: hook_name.to_string(),
+        url: url.to_string(),
+    })?;
+
+    if parsed.scheme() != "https" {
+        return Err(HookBundleError::InvalidWebhookScheme {
+            hook: hook_name.to_string(),
+            scheme: parsed.scheme().to_string(),
+        });
+    }
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(HookBundleError::InvalidWebhookUrl {
+            hook: hook_name.to_string(),
+            url: url.to_string(),
+        });
+    }
+
+    if let Some(host) = parsed.host_str() {
+        if is_forbidden_webhook_host(host) {
+            return Err(HookBundleError::ForbiddenWebhookHost {
+                hook: hook_name.to_string(),
+                host: host.to_string(),
+            });
+        }
+
+        if let Ok(ip) = host.parse::<IpAddr>()
+            && is_forbidden_ip(ip)
+        {
+            return Err(HookBundleError::ForbiddenWebhookHost {
+                hook: hook_name.to_string(),
+                host: host.to_string(),
+            });
+        }
+    }
+
+    Ok(parsed)
+}
+
+async fn validate_webhook_target_runtime(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "Webhook URL has no host".to_string())?;
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_forbidden_ip(ip) {
+            return Err(format!("Webhook target resolves to blocked IP {ip}"));
+        }
+        return Ok(());
+    }
+
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "Webhook URL has no valid port".to_string())?;
+
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("DNS resolution failed: {e}"))?;
+
+    for addr in addrs {
+        if is_forbidden_ip(addr.ip()) {
+            return Err(format!("Webhook target resolves to blocked IP {}", addr.ip()));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_webhook_headers(
+    hook_name: &str,
+    headers: &HashMap<String, String>,
+) -> Result<HeaderMap, HookBundleError> {
+    let mut validated = HeaderMap::new();
+
+    for (name, value) in headers {
+        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+            HookBundleError::InvalidWebhookHeader {
+                hook: hook_name.to_string(),
+                header: name.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+
+        if is_forbidden_header(header_name.as_str()) {
+            return Err(HookBundleError::ForbiddenWebhookHeader {
+                hook: hook_name.to_string(),
+                header: name.clone(),
+            });
+        }
+
+        let header_value =
+            HeaderValue::from_str(value).map_err(|e| HookBundleError::InvalidWebhookHeader {
+                hook: hook_name.to_string(),
+                header: name.clone(),
+                reason: e.to_string(),
+            })?;
+
+        validated.insert(header_name, header_value);
+    }
+
+    Ok(validated)
+}
+
+fn is_forbidden_webhook_host(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower == "host.docker.internal"
+        || lower == "metadata.google.internal"
+        || lower == "metadata.aws.internal"
+}
+
+fn is_forbidden_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+            {
+                return true;
+            }
+
+            let octets = v4.octets();
+
+            // Carrier-grade NAT range (100.64.0.0/10).
+            if octets[0] == 100 && (64..=127).contains(&octets[1]) {
+                return true;
+            }
+
+            // Benchmark testing range (198.18.0.0/15).
+            if octets[0] == 198 && matches!(octets[1], 18 | 19) {
+                return true;
+            }
+
+            false
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_multicast()
+            {
+                return true;
+            }
+
+            // Documentation range (2001:db8::/32).
+            let segments = v6.segments();
+            segments[0] == 0x2001 && segments[1] == 0x0db8
+        }
+    }
+}
+
+fn is_forbidden_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "host"
+        || lower == "authorization"
+        || lower == "cookie"
+        || lower == "proxy-authorization"
+        || lower == "forwarded"
+        || lower == "x-real-ip"
+        || lower == "transfer-encoding"
+        || lower == "connection"
+        || lower.starts_with("x-forwarded-")
 }
 
 fn timeout_from_ms(timeout_ms: Option<u64>, hook_name: &str) -> Result<Duration, HookBundleError> {
@@ -641,10 +949,11 @@ mod tests {
             outbound_webhooks: vec![OutboundWebhookConfig {
                 name: "notify".to_string(),
                 points: vec![HookPoint::BeforeInbound],
-                url: "http://127.0.0.1:9/hook".to_string(),
+                url: "https://example.com/hook".to_string(),
                 headers: HashMap::new(),
                 timeout_ms: Some(1000),
                 priority: None,
+                max_in_flight: None,
             }],
         };
 
@@ -654,5 +963,188 @@ mod tests {
         // Should return immediately regardless of webhook delivery result.
         let result = registry.run(&inbound_event("hello")).await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_timeout_from_ms_rejects_zero() {
+        let err = timeout_from_ms(Some(0), "hook").unwrap_err();
+        assert!(matches!(err, HookBundleError::InvalidTimeout { .. }));
+    }
+
+    #[test]
+    fn test_timeout_from_ms_rejects_above_limit() {
+        let err = timeout_from_ms(Some(30_001), "hook").unwrap_err();
+        assert!(matches!(err, HookBundleError::InvalidTimeout { .. }));
+    }
+
+    #[test]
+    fn test_rule_hook_requires_points() {
+        let config = HookRuleConfig {
+            name: "invalid".to_string(),
+            points: vec![],
+            priority: None,
+            failure_mode: None,
+            timeout_ms: None,
+            when_regex: None,
+            reject_reason: None,
+            replacements: vec![],
+            prepend: None,
+            append: None,
+        };
+
+        let err = RuleHook::from_config("workspace:hooks/hooks.json", config).unwrap_err();
+        assert!(matches!(err, HookBundleError::MissingHookPoints { .. }));
+    }
+
+    #[test]
+    fn test_invalid_webhook_scheme_rejected() {
+        let config = OutboundWebhookConfig {
+            name: "notify".to_string(),
+            points: vec![HookPoint::BeforeInbound],
+            url: "http://example.com/hook".to_string(),
+            headers: HashMap::new(),
+            timeout_ms: None,
+            priority: None,
+            max_in_flight: None,
+        };
+
+        let err =
+            OutboundWebhookHook::from_config("workspace:hooks/hooks.json", config).unwrap_err();
+        assert!(matches!(err, HookBundleError::InvalidWebhookScheme { .. }));
+    }
+
+    #[test]
+    fn test_private_webhook_host_rejected() {
+        let config = OutboundWebhookConfig {
+            name: "notify".to_string(),
+            points: vec![HookPoint::BeforeInbound],
+            url: "https://127.0.0.1/hook".to_string(),
+            headers: HashMap::new(),
+            timeout_ms: None,
+            priority: None,
+            max_in_flight: None,
+        };
+
+        let err =
+            OutboundWebhookHook::from_config("workspace:hooks/hooks.json", config).unwrap_err();
+        assert!(matches!(err, HookBundleError::ForbiddenWebhookHost { .. }));
+    }
+
+    #[test]
+    fn test_restricted_webhook_header_rejected() {
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer token".to_string());
+
+        let config = OutboundWebhookConfig {
+            name: "notify".to_string(),
+            points: vec![HookPoint::BeforeInbound],
+            url: "https://example.com/hook".to_string(),
+            headers,
+            timeout_ms: None,
+            priority: None,
+            max_in_flight: None,
+        };
+
+        let err =
+            OutboundWebhookHook::from_config("workspace:hooks/hooks.json", config).unwrap_err();
+        assert!(matches!(
+            err,
+            HookBundleError::ForbiddenWebhookHeader { .. }
+        ));
+    }
+
+    #[test]
+    fn test_zero_max_in_flight_rejected() {
+        let config = OutboundWebhookConfig {
+            name: "notify".to_string(),
+            points: vec![HookPoint::BeforeInbound],
+            url: "https://example.com/hook".to_string(),
+            headers: HashMap::new(),
+            timeout_ms: None,
+            priority: None,
+            max_in_flight: Some(0),
+        };
+
+        let err =
+            OutboundWebhookHook::from_config("workspace:hooks/hooks.json", config).unwrap_err();
+        assert!(matches!(
+            err,
+            HookBundleError::InvalidWebhookMaxInFlight { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_runtime_target_validation_blocks_private_ip() {
+        let err = validate_webhook_target_runtime("https://127.0.0.1/hook")
+            .await
+            .unwrap_err();
+        assert!(err.contains("blocked IP"));
+    }
+
+    #[tokio::test]
+    async fn test_runtime_target_validation_allows_public_ip() {
+        let result = validate_webhook_target_runtime("https://1.1.1.1/hook").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rule_guard_no_match_is_passthrough() {
+        let registry = Arc::new(HookRegistry::new());
+
+        let bundle = HookBundleConfig {
+            rules: vec![HookRuleConfig {
+                name: "guarded-rewrite".to_string(),
+                points: vec![HookPoint::BeforeInbound],
+                priority: None,
+                failure_mode: None,
+                timeout_ms: None,
+                when_regex: Some("forbidden".to_string()),
+                reject_reason: None,
+                replacements: vec![RegexReplacementConfig {
+                    pattern: "hello".to_string(),
+                    replacement: "hi".to_string(),
+                }],
+                prepend: None,
+                append: None,
+            }],
+            outbound_webhooks: vec![],
+        };
+
+        register_bundle(&registry, "workspace:hooks/hooks.json", bundle).await;
+        let result = registry.run(&inbound_event("hello world")).await.unwrap();
+        assert!(matches!(result, HookOutcome::Continue { modified: None }));
+    }
+
+    #[tokio::test]
+    async fn test_rule_hook_combined_actions() {
+        let registry = Arc::new(HookRegistry::new());
+
+        let bundle = HookBundleConfig {
+            rules: vec![HookRuleConfig {
+                name: "combined".to_string(),
+                points: vec![HookPoint::BeforeInbound],
+                priority: None,
+                failure_mode: None,
+                timeout_ms: None,
+                when_regex: None,
+                reject_reason: None,
+                replacements: vec![RegexReplacementConfig {
+                    pattern: "secret".to_string(),
+                    replacement: "safe".to_string(),
+                }],
+                prepend: Some("[".to_string()),
+                append: Some("]".to_string()),
+            }],
+            outbound_webhooks: vec![],
+        };
+
+        register_bundle(&registry, "workspace:hooks/hooks.json", bundle).await;
+        let result = registry.run(&inbound_event("secret")).await.unwrap();
+        match result {
+            HookOutcome::Continue {
+                modified: Some(value),
+            } => assert_eq!(value, "[safe]"),
+            other => panic!("expected modified output, got {other:?}"),
+        }
     }
 }
