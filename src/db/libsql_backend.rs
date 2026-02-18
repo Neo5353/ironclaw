@@ -218,6 +218,10 @@ fn get_i64(row: &libsql::Row, idx: i32) -> i64 {
     row.get::<i64>(idx).unwrap_or(0)
 }
 
+fn get_f64(row: &libsql::Row, idx: i32) -> f64 {
+    row.get::<f64>(idx).unwrap_or(0.0)
+}
+
 /// Extract an optional bool from an integer column.
 fn get_opt_bool(row: &libsql::Row, idx: i32) -> Option<bool> {
     row.get::<i64>(idx).ok().map(|v| v != 0)
@@ -2601,7 +2605,164 @@ impl Database for LibSqlBackend {
             );
         }
 
-        Ok(reciprocal_rank_fusion(fts_results, vector_results, config))
+        // TODO: Implement graph results in database-level search
+        Ok(reciprocal_rank_fusion(fts_results, vector_results, Vec::new(), config))
+    }
+
+    // ==================== Memory Graph ====================
+
+    async fn store_memory_edge(
+        &self,
+        user_id: &str,
+        edge: &crate::workspace::MemoryEdge,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        
+        let metadata_json = edge.metadata.as_ref()
+            .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "null".to_string()))
+            .unwrap_or_else(|| "null".to_string());
+        
+        conn.execute(
+            r#"
+            INSERT INTO memory_edges (
+                id, user_id, source_id, target_id, relation, weight, metadata, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![
+                edge.id.to_string(),
+                user_id,
+                edge.source_id.to_string(),
+                edge.target_id.to_string(),
+                edge.relation.clone(),
+                edge.weight,
+                metadata_json,
+                edge.created_at.to_rfc3339()
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(format!("Failed to store memory edge: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn get_memory_edges_from(
+        &self,
+        user_id: &str,
+        source_id: Uuid,
+    ) -> Result<Vec<crate::workspace::MemoryEdge>, DatabaseError> {
+        let conn = self.connect().await?;
+
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT id, user_id, source_id, target_id, relation, weight, metadata, created_at
+                FROM memory_edges 
+                WHERE user_id = ?1 AND source_id = ?2
+                ORDER BY created_at DESC
+                "#,
+                params![user_id, source_id.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(format!("Failed to get edges from source: {}", e)))?;
+
+        let mut edges = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(format!("Failed to fetch edge row: {}", e)))?
+        {
+            edges.push(row_to_memory_edge(&row)?);
+        }
+
+        Ok(edges)
+    }
+
+    async fn get_memory_edges_to(
+        &self,
+        user_id: &str,
+        target_id: Uuid,
+    ) -> Result<Vec<crate::workspace::MemoryEdge>, DatabaseError> {
+        let conn = self.connect().await?;
+
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT id, user_id, source_id, target_id, relation, weight, metadata, created_at
+                FROM memory_edges 
+                WHERE user_id = ?1 AND target_id = ?2
+                ORDER BY created_at DESC
+                "#,
+                params![user_id, target_id.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(format!("Failed to get edges to target: {}", e)))?;
+
+        let mut edges = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(format!("Failed to fetch edge row: {}", e)))?
+        {
+            edges.push(row_to_memory_edge(&row)?);
+        }
+
+        Ok(edges)
+    }
+
+    async fn delete_memory_edge(
+        &self,
+        user_id: &str,
+        edge_id: Uuid,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+
+        let result = conn
+            .execute(
+                "DELETE FROM memory_edges WHERE user_id = ?1 AND id = ?2",
+                params![user_id, edge_id.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(format!("Failed to delete memory edge: {}", e)))?;
+
+        if result == 0 {
+            return Err(DatabaseError::NotFound {
+                entity: "memory_edge".to_string(),
+                id: edge_id.to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn get_all_memory_edges(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::workspace::MemoryEdge>, DatabaseError> {
+        let conn = self.connect().await?;
+
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT id, user_id, source_id, target_id, relation, weight, metadata, created_at
+                FROM memory_edges 
+                WHERE user_id = ?1
+                ORDER BY created_at DESC
+                "#,
+                params![user_id],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(format!("Failed to get all memory edges: {}", e)))?;
+
+        let mut edges = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(format!("Failed to fetch edge row: {}", e)))?
+        {
+            edges.push(row_to_memory_edge(&row)?);
+        }
+
+        Ok(edges)
     }
 }
 
@@ -2618,6 +2779,41 @@ fn row_to_memory_document(row: &libsql::Row) -> MemoryDocument {
         updated_at: get_ts(row, 6),
         metadata: get_json(row, 7),
     }
+}
+
+fn row_to_memory_edge(row: &libsql::Row) -> Result<crate::workspace::MemoryEdge, DatabaseError> {
+    use crate::workspace::MemoryEdge;
+    
+    let id = get_text(row, 0)
+        .parse()
+        .map_err(|e| DatabaseError::Serialization(format!("Invalid edge ID: {}", e)))?;
+    
+    let source_id = get_text(row, 2)
+        .parse()
+        .map_err(|e| DatabaseError::Serialization(format!("Invalid source ID: {}", e)))?;
+        
+    let target_id = get_text(row, 3)
+        .parse()
+        .map_err(|e| DatabaseError::Serialization(format!("Invalid target ID: {}", e)))?;
+    
+    let relation = get_text(row, 4);
+    let weight = get_f64(row, 5) as f32;
+    
+    let metadata = get_opt_text(row, 6)
+        .filter(|s| s != "null" && !s.is_empty())
+        .and_then(|s| serde_json::from_str(&s).ok());
+    
+    let created_at = get_ts(row, 7);
+    
+    Ok(MemoryEdge {
+        id,
+        source_id,
+        target_id,
+        relation,
+        weight,
+        metadata,
+        created_at,
+    })
 }
 
 fn row_to_routine_libsql(row: &libsql::Row) -> Result<Routine, DatabaseError> {

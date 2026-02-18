@@ -628,4 +628,51 @@ impl Database for PgBackend {
             .hybrid_search(user_id, agent_id, query, embedding, config)
             .await
     }
+
+    // ==================== Memory Graph (Stub Implementation) ====================
+
+    async fn store_memory_edge(
+        &self,
+        user_id: &str,
+        edge: &crate::workspace::MemoryEdge,
+    ) -> Result<(), DatabaseError> {
+        let _ = (user_id, edge);
+        tracing::warn!("Memory graph not yet implemented for PostgreSQL backend");
+        Ok(())
+    }
+
+    async fn get_memory_edges_from(
+        &self,
+        user_id: &str,
+        source_id: Uuid,
+    ) -> Result<Vec<crate::workspace::MemoryEdge>, DatabaseError> {
+        let _ = (user_id, source_id);
+        Ok(Vec::new())
+    }
+
+    async fn get_memory_edges_to(
+        &self,
+        user_id: &str,
+        target_id: Uuid,
+    ) -> Result<Vec<crate::workspace::MemoryEdge>, DatabaseError> {
+        let _ = (user_id, target_id);
+        Ok(Vec::new())
+    }
+
+    async fn delete_memory_edge(
+        &self,
+        user_id: &str,
+        edge_id: Uuid,
+    ) -> Result<(), DatabaseError> {
+        let _ = (user_id, edge_id);
+        Ok(())
+    }
+
+    async fn get_all_memory_edges(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::workspace::MemoryEdge>, DatabaseError> {
+        let _ = user_id;
+        Ok(Vec::new())
+    }
 }

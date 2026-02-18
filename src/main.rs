@@ -41,7 +41,7 @@ use ironclaw::{
         mcp::{McpClient, McpSessionManager, config::load_mcp_servers_from_db, is_authenticated},
         wasm::{WasmToolLoader, WasmToolRuntime, load_dev_tools},
     },
-    workspace::{EmbeddingProvider, OpenAiEmbeddings, Workspace},
+    workspace::{EmbeddingProvider, OpenAiEmbeddings, FastEmbedProvider, Workspace},
 };
 
 #[cfg(feature = "libsql")]
@@ -99,23 +99,44 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            // Set up embeddings if available (OpenAI only after removing NEAR AI)
+            // Set up embeddings if available
             let embeddings: Option<Arc<dyn ironclaw::workspace::EmbeddingProvider>> =
                 if config.embeddings.enabled {
                     match config.embeddings.provider.as_str() {
-                        _ => {
+                        "local" => {
+                            match ironclaw::workspace::FastEmbedProvider::with_model(&config.embeddings.model) {
+                                Ok(provider) => {
+                                    tracing::info!("Embeddings enabled via FastEmbed (model: {})", config.embeddings.model);
+                                    Some(Arc::new(provider))
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to initialize local embeddings: {}", e);
+                                    None
+                                }
+                            }
+                        }
+                        "openai" => {
                             if let Some(api_key) = config.embeddings.openai_api_key() {
-                                let dim = match config.embeddings.model.as_str() {
-                                    "text-embedding-3-large" => 3072,
-                                    _ => 1536,
-                                };
+                                tracing::info!("Embeddings enabled via OpenAI (model: {})", config.embeddings.model);
                                 Some(Arc::new(ironclaw::workspace::OpenAiEmbeddings::with_model(
                                     api_key,
                                     &config.embeddings.model,
-                                    dim,
+                                    config.embeddings.dimension,
                                 )))
                             } else {
+                                tracing::warn!("OpenAI embeddings configured but OPENAI_API_KEY not set");
                                 None
+                            }
+                        }
+                        _ => {
+                            tracing::warn!("Unknown embedding provider '{}', falling back to local", config.embeddings.provider);
+                            match ironclaw::workspace::FastEmbedProvider::with_model(&config.embeddings.model) {
+                                Ok(provider) => Some(Arc::new(provider)),
+                                Err(_) => {
+                                    match ironclaw::workspace::FastEmbedProvider::new() {
+                                        provider => Some(Arc::new(provider)),
+                                    }
+                                }
                             }
                         }
                     }
@@ -599,30 +620,40 @@ async fn main() -> anyhow::Result<()> {
     // Create embeddings provider if configured
     let embeddings: Option<Arc<dyn EmbeddingProvider>> = if config.embeddings.enabled {
         match config.embeddings.provider.as_str() {
-            // NEAR AI embeddings removed in local-first refactor
-            _ => {
-                // Default to OpenAI for unknown providers
+            "local" => {
+                match FastEmbedProvider::with_model(&config.embeddings.model) {
+                    Ok(provider) => {
+                        tracing::info!("Embeddings enabled via FastEmbed (model: {})", config.embeddings.model);
+                        Some(Arc::new(provider))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to initialize local embeddings: {}, using default model", e);
+                        let provider = FastEmbedProvider::new();
+                        Some(Arc::new(provider))
+                    }
+                }
+            }
+            "openai" => {
                 if let Some(api_key) = config.embeddings.openai_api_key() {
-                    tracing::info!(
-                        "Embeddings enabled via OpenAI (model: {})",
-                        config.embeddings.model
-                    );
+                    tracing::info!("Embeddings enabled via OpenAI (model: {})", config.embeddings.model);
                     Some(Arc::new(OpenAiEmbeddings::with_model(
                         api_key,
                         &config.embeddings.model,
-                        match config.embeddings.model.as_str() {
-                            "text-embedding-3-large" => 3072,
-                            _ => 1536, // text-embedding-3-small and ada-002
-                        },
+                        config.embeddings.dimension,
                     )))
                 } else {
-                    tracing::warn!("Embeddings configured but OPENAI_API_KEY not set");
+                    tracing::warn!("OpenAI embeddings configured but OPENAI_API_KEY not set");
                     None
                 }
             }
+            _ => {
+                tracing::warn!("Unknown embedding provider '{}', falling back to local", config.embeddings.provider);
+                let provider = FastEmbedProvider::new();
+                Some(Arc::new(provider))
+            }
         }
     } else {
-        tracing::info!("Embeddings disabled (set OPENAI_API_KEY or EMBEDDING_ENABLED=true)");
+        tracing::info!("Embeddings disabled (set EMBEDDING_ENABLED=true to enable local embeddings)");
         None
     };
 

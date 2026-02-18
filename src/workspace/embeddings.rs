@@ -71,7 +71,7 @@ pub struct OpenAiEmbeddings {
 impl OpenAiEmbeddings {
     /// Create a new OpenAI embedding provider with the default model.
     ///
-    /// Uses text-embedding-3-small which has 1536 dimensions.
+    /// Uses text-embedding-3-small which has 1536 dimensions by default.
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -323,5 +323,9 @@ mod tests {
         let provider = OpenAiEmbeddings::large("test-key");
         assert_eq!(provider.dimension(), 3072);
         assert_eq!(provider.model_name(), "text-embedding-3-large");
+
+        let provider = OpenAiEmbeddings::with_model("test-key", "text-embedding-3-small", 384);
+        assert_eq!(provider.dimension(), 384);
+        assert_eq!(provider.model_name(), "text-embedding-3-small");
     }
 }

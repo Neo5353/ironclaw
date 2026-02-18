@@ -624,21 +624,24 @@ impl LlmConfig {
 pub struct EmbeddingsConfig {
     /// Whether embeddings are enabled.
     pub enabled: bool,
-    /// Provider to use: "openai" (nearai removed in local-first refactor)
+    /// Provider to use: "local", "openai"
     pub provider: String,
     /// OpenAI API key (for OpenAI provider).
     pub openai_api_key: Option<SecretString>,
     /// Model to use for embeddings.
     pub model: String,
+    /// Embedding dimension.
+    pub dimension: usize,
 }
 
 impl Default for EmbeddingsConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            provider: "openai".to_string(),
+            enabled: true,  // Local embeddings should be on by default
+            provider: "local".to_string(),  // Default to local
             openai_api_key: None,
-            model: "text-embedding-3-small".to_string(),
+            model: "BAAI/bge-small-en-v1.5".to_string(),  // Default local model
+            dimension: 384,  // Default dimension for GTE-small
         }
     }
 }
@@ -662,11 +665,26 @@ impl EmbeddingsConfig {
             })?
             .unwrap_or(settings.embeddings.enabled);
 
+        // Determine dimension based on provider and model
+        let dimension = match provider.as_str() {
+            "local" => match model.as_str() {
+                "BAAI/bge-small-en-v1.5" | "thenlper/gte-small" => 384,
+                _ => 384, // Default for local models
+            },
+            "openai" => match model.as_str() {
+                "text-embedding-ada-002" | "text-embedding-3-small" => 1536,
+                "text-embedding-3-large" => 3072,
+                _ => 1536, // Default for OpenAI
+            },
+            _ => 384, // Default fallback
+        };
+
         Ok(Self {
             enabled,
             provider,
             openai_api_key,
             model,
+            dimension,
         })
     }
 

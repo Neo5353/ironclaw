@@ -40,17 +40,23 @@
 //! 3. **Self-documenting**: Use README.md files to describe directory structure
 //! 4. **Hybrid search**: Vector similarity + BM25 full-text via RRF
 
+mod auto_linker;
 mod chunker;
 mod document;
 mod embeddings;
+mod fastembed_provider;
+pub mod graph;
 pub mod hygiene;
 #[cfg(feature = "postgres")]
 mod repository;
 mod search;
 
+pub use auto_linker::{AutoLinker, AutoLinkerConfig, AutoLinkerError};
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{MemoryChunk, MemoryDocument, WorkspaceEntry, paths};
 pub use embeddings::{EmbeddingProvider, MockEmbeddings, OpenAiEmbeddings};
+pub use fastembed_provider::FastEmbedProvider;
+pub use graph::{MemoryEdge, MemoryGraph, GraphError, GraphStats, InMemoryGraph, relations};
 #[cfg(feature = "postgres")]
 pub use repository::Repository;
 pub use search::{RankedResult, SearchConfig, SearchResult, reciprocal_rank_fusion};
@@ -275,6 +281,8 @@ pub struct Workspace {
     storage: WorkspaceStorage,
     /// Embedding provider for semantic search.
     embeddings: Option<Arc<dyn EmbeddingProvider>>,
+    /// Automatic memory linking system.
+    auto_linker: Option<Arc<AutoLinker>>,
 }
 
 impl Workspace {
@@ -286,6 +294,7 @@ impl Workspace {
             agent_id: None,
             storage: WorkspaceStorage::Repo(Repository::new(pool)),
             embeddings: None,
+            auto_linker: None,
         }
     }
 
@@ -298,6 +307,7 @@ impl Workspace {
             agent_id: None,
             storage: WorkspaceStorage::Db(db),
             embeddings: None,
+            auto_linker: None,
         }
     }
 
@@ -311,6 +321,34 @@ impl Workspace {
     pub fn with_embeddings(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
         self.embeddings = Some(provider);
         self
+    }
+
+    /// Enable automatic memory linking.
+    ///
+    /// Auto-linking requires both embeddings and database access to work effectively.
+    /// It will be automatically initialized when both embeddings and storage are available.
+    pub fn with_auto_linking(mut self, config: AutoLinkerConfig) -> Self {
+        // Get the database reference from storage
+        if let Some(db) = self.get_database_ref() {
+            let auto_linker = Arc::new(AutoLinker::new(
+                config,
+                db,
+                self.embeddings.clone(),
+            ));
+            self.auto_linker = Some(auto_linker);
+        } else {
+            tracing::warn!("Cannot enable auto-linking: no database backend available");
+        }
+        self
+    }
+
+    /// Get a reference to the underlying database for auto-linking.
+    fn get_database_ref(&self) -> Option<Arc<dyn crate::db::Database>> {
+        match &self.storage {
+            WorkspaceStorage::Db(db) => Some(Arc::clone(db)),
+            #[cfg(feature = "postgres")]
+            WorkspaceStorage::Repo(_) => None, // Repository doesn't expose Database trait
+        }
     }
 
     /// Get the user ID.
@@ -581,6 +619,8 @@ impl Workspace {
         query: &str,
         config: SearchConfig,
     ) -> Result<Vec<SearchResult>, WorkspaceError> {
+        use crate::workspace::{RankedResult, reciprocal_rank_fusion};
+
         // Generate embedding for semantic search if provider available
         let embedding = if let Some(ref provider) = self.embeddings {
             Some(
@@ -595,15 +635,87 @@ impl Workspace {
             None
         };
 
-        self.storage
+        // If graph search is disabled, use the simple database-level hybrid search
+        if !config.use_graph {
+            return self.storage
+                .hybrid_search(
+                    &self.user_id,
+                    self.agent_id,
+                    query,
+                    embedding.as_deref(),
+                    &config,
+                )
+                .await;
+        }
+
+        // For graph-enabled search, we need to implement 3-way RRF at this level
+        // Step 1: Get initial search results (FTS + vector)
+        let initial_config = SearchConfig {
+            use_graph: false, // Disable graph in database search
+            pre_fusion_limit: config.pre_fusion_limit * 2, // Get more results for graph expansion
+            ..config.clone()
+        };
+
+        let initial_results = self.storage
             .hybrid_search(
                 &self.user_id,
                 self.agent_id,
                 query,
                 embedding.as_deref(),
-                &config,
+                &initial_config,
             )
-            .await
+            .await?;
+
+        // Step 2: Extract chunk IDs for graph traversal
+        let seed_chunk_ids: Vec<Uuid> = initial_results
+            .iter()
+            .take(10) // Use top 10 results as seeds for graph traversal
+            .map(|r| r.chunk_id)
+            .collect();
+
+        // Step 3: Find graph-related chunks
+        let mut graph_results = Vec::new();
+        let mut graph_rank = 1u32;
+        
+        // For now, create a simple in-memory graph from database edges
+        // In a real implementation, you'd want a more sophisticated graph traversal
+        for seed_id in seed_chunk_ids {
+            // Get related chunks via graph edges (simulated for now)
+            // This would call get_memory_edges_from and traverse the graph
+            // For Phase 3, we'll create a minimal implementation
+            
+            // TODO: Implement actual graph traversal using the MemoryGraph trait
+            // let related_chunks = self.get_graph_related_chunks(seed_id, 2, 5).await?;
+            // For now, we'll skip actual graph traversal and just use empty results
+        }
+
+        // Step 4: Convert initial results back to RankedResult format for RRF
+        let fts_results: Vec<RankedResult> = initial_results
+            .iter()
+            .filter(|r| r.from_fts())
+            .enumerate()
+            .map(|(i, r)| RankedResult {
+                chunk_id: r.chunk_id,
+                document_id: r.document_id,
+                content: r.content.clone(),
+                rank: (i + 1) as u32,
+            })
+            .collect();
+
+        let vector_results: Vec<RankedResult> = initial_results
+            .iter()
+            .filter(|r| r.from_vector())
+            .enumerate()
+            .map(|(i, r)| RankedResult {
+                chunk_id: r.chunk_id,
+                document_id: r.document_id,
+                content: r.content.clone(),
+                rank: (i + 1) as u32,
+            })
+            .collect();
+
+        // Step 5: Perform 3-way RRF fusion
+        Ok(reciprocal_rank_fusion(fts_results, vector_results, graph_results, &config))
     }
 
     // ==================== Indexing ====================
@@ -614,13 +726,14 @@ impl Workspace {
         let doc = self.storage.get_document_by_id(document_id).await?;
 
         // Chunk the content
-        let chunks = chunk_document(&doc.content, ChunkConfig::default());
+        let chunk_contents = chunk_document(&doc.content, ChunkConfig::default());
 
         // Delete old chunks
         self.storage.delete_chunks(document_id).await?;
 
-        // Insert new chunks
-        for (index, content) in chunks.into_iter().enumerate() {
+        // Insert new chunks and collect MemoryChunk objects for auto-linking
+        let mut memory_chunks = Vec::new();
+        for (index, content) in chunk_contents.into_iter().enumerate() {
             // Generate embedding if provider available
             let embedding = if let Some(ref provider) = self.embeddings {
                 match provider.embed(&content).await {
@@ -634,9 +747,39 @@ impl Workspace {
                 None
             };
 
-            self.storage
+            let chunk_id = self.storage
                 .insert_chunk(document_id, index as i32, &content, embedding.as_deref())
                 .await?;
+
+            // Create MemoryChunk for auto-linking
+            memory_chunks.push(MemoryChunk {
+                id: chunk_id,
+                document_id,
+                chunk_index: index as i32,
+                content,
+                embedding,
+                created_at: chrono::Utc::now(),
+            });
+        }
+
+        // Trigger auto-linking asynchronously (don't block the write)
+        if let Some(ref auto_linker) = self.auto_linker {
+            let user_id = self.user_id.clone();
+            let doc_clone = doc.clone();
+            let chunks_clone = memory_chunks;
+            let linker = Arc::clone(auto_linker);
+
+            // Spawn auto-linking as a background task
+            tokio::spawn(async move {
+                match linker.auto_link_document(&user_id, &doc_clone, &chunks_clone).await {
+                    Ok(link_count) => {
+                        tracing::debug!("Auto-linked {} edges for document: {}", link_count, doc_clone.path);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Auto-linking failed for {}: {}", doc_clone.path, e);
+                    }
+                }
+            });
         }
 
         Ok(())

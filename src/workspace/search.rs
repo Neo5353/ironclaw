@@ -23,6 +23,8 @@ pub struct SearchConfig {
     pub use_fts: bool,
     /// Whether to include vector results.
     pub use_vector: bool,
+    /// Whether to include graph-related results.
+    pub use_graph: bool,
     /// Minimum score threshold (0.0-1.0).
     pub min_score: f32,
     /// Maximum results to fetch from each method before fusion.
@@ -36,6 +38,7 @@ impl Default for SearchConfig {
             rrf_k: 60,
             use_fts: true,
             use_vector: true,
+            use_graph: true,
             min_score: 0.0,
             pre_fusion_limit: 50,
         }
@@ -74,6 +77,26 @@ impl SearchConfig {
         self.min_score = score.clamp(0.0, 1.0);
         self
     }
+
+    /// Enable/disable graph search.
+    pub fn with_graph(mut self, use_graph: bool) -> Self {
+        self.use_graph = use_graph;
+        self
+    }
+
+    /// Disable graph search (use FTS + vector only).
+    pub fn no_graph(mut self) -> Self {
+        self.use_graph = false;
+        self
+    }
+
+    /// Use graph search only.
+    pub fn graph_only(mut self) -> Self {
+        self.use_fts = false;
+        self.use_vector = false;
+        self.use_graph = true;
+        self
+    }
 }
 
 /// A search result with hybrid scoring.
@@ -91,6 +114,8 @@ pub struct SearchResult {
     pub fts_rank: Option<u32>,
     /// Rank in vector results (1-based, None if not in vector results).
     pub vector_rank: Option<u32>,
+    /// Rank in graph results (1-based, None if not in graph results).
+    pub graph_rank: Option<u32>,
 }
 
 impl SearchResult {
@@ -104,9 +129,25 @@ impl SearchResult {
         self.vector_rank.is_some()
     }
 
-    /// Check if this result came from both methods (hybrid match).
+    /// Check if this result came from graph search.
+    pub fn from_graph(&self) -> bool {
+        self.graph_rank.is_some()
+    }
+
+    /// Check if this result came from multiple methods.
     pub fn is_hybrid(&self) -> bool {
-        self.fts_rank.is_some() && self.vector_rank.is_some()
+        [self.fts_rank, self.vector_rank, self.graph_rank]
+            .iter()
+            .filter(|r| r.is_some())
+            .count() > 1
+    }
+
+    /// Count how many search methods contributed to this result.
+    pub fn method_count(&self) -> usize {
+        [self.fts_rank, self.vector_rank, self.graph_rank]
+            .iter()
+            .filter(|r| r.is_some())
+            .count()
     }
 }
 
@@ -136,6 +177,7 @@ pub struct RankedResult {
 pub fn reciprocal_rank_fusion(
     fts_results: Vec<RankedResult>,
     vector_results: Vec<RankedResult>,
+    graph_results: Vec<RankedResult>,
     config: &SearchConfig,
 ) -> Vec<SearchResult> {
     let k = config.rrf_k as f32;
@@ -147,6 +189,7 @@ pub fn reciprocal_rank_fusion(
         score: f32,
         fts_rank: Option<u32>,
         vector_rank: Option<u32>,
+        graph_rank: Option<u32>,
     }
 
     let mut chunk_scores: HashMap<Uuid, ChunkInfo> = HashMap::new();
@@ -166,6 +209,7 @@ pub fn reciprocal_rank_fusion(
                 score: rrf_score,
                 fts_rank: Some(result.rank),
                 vector_rank: None,
+                graph_rank: None,
             });
     }
 
@@ -184,6 +228,26 @@ pub fn reciprocal_rank_fusion(
                 score: rrf_score,
                 fts_rank: None,
                 vector_rank: Some(result.rank),
+                graph_rank: None,
+            });
+    }
+
+    // Process graph results
+    for result in graph_results {
+        let rrf_score = 1.0 / (k + result.rank as f32);
+        chunk_scores
+            .entry(result.chunk_id)
+            .and_modify(|info| {
+                info.score += rrf_score;
+                info.graph_rank = Some(result.rank);
+            })
+            .or_insert(ChunkInfo {
+                document_id: result.document_id,
+                content: result.content,
+                score: rrf_score,
+                fts_rank: None,
+                vector_rank: None,
+                graph_rank: Some(result.rank),
             });
     }
 
@@ -197,6 +261,7 @@ pub fn reciprocal_rank_fusion(
             score: info.score,
             fts_rank: info.fts_rank,
             vector_rank: info.vector_rank,
+            graph_rank: info.graph_rank,
         })
         .collect();
 
@@ -250,7 +315,7 @@ mod tests {
 
         let fts_results = vec![make_result(chunk1, doc, 1), make_result(chunk2, doc, 2)];
 
-        let results = reciprocal_rank_fusion(fts_results, Vec::new(), &config);
+        let results = reciprocal_rank_fusion(fts_results, Vec::new(), Vec::new(), &config);
 
         assert_eq!(results.len(), 2);
         // First result should have higher score
@@ -273,7 +338,7 @@ mod tests {
 
         let vector_results = vec![make_result(chunk1, doc, 1), make_result(chunk3, doc, 2)];
 
-        let results = reciprocal_rank_fusion(fts_results, vector_results, &config);
+        let results = reciprocal_rank_fusion(fts_results, vector_results, Vec::new(), &config);
 
         assert_eq!(results.len(), 3);
 
@@ -296,7 +361,7 @@ mod tests {
 
         let fts_results = vec![make_result(chunk1, doc, 1)];
 
-        let results = reciprocal_rank_fusion(fts_results, Vec::new(), &config);
+        let results = reciprocal_rank_fusion(fts_results, Vec::new(), Vec::new(), &config);
 
         // Single result should have normalized score of 1.0
         assert_eq!(results.len(), 1);
@@ -319,7 +384,7 @@ mod tests {
             make_result(chunk3, doc, 100),
         ];
 
-        let results = reciprocal_rank_fusion(fts_results, Vec::new(), &config);
+        let results = reciprocal_rank_fusion(fts_results, Vec::new(), Vec::new(), &config);
 
         // Low-scoring results should be filtered out
         // All results should have score >= 0.5
@@ -337,7 +402,7 @@ mod tests {
             .map(|i| make_result(Uuid::new_v4(), doc, i))
             .collect();
 
-        let results = reciprocal_rank_fusion(fts_results, Vec::new(), &config);
+        let results = reciprocal_rank_fusion(fts_results, Vec::new(), Vec::new(), &config);
 
         assert_eq!(results.len(), 2);
     }
@@ -353,11 +418,11 @@ mod tests {
 
         // Low k: rank 1 score = 1/(10+1) = 0.091, rank 2 = 1/(10+2) = 0.083
         let config_low_k = SearchConfig::default().with_rrf_k(10);
-        let results_low = reciprocal_rank_fusion(fts_results.clone(), Vec::new(), &config_low_k);
+        let results_low = reciprocal_rank_fusion(fts_results.clone(), Vec::new(), Vec::new(), &config_low_k);
 
         // High k: rank 1 score = 1/(100+1) = 0.0099, rank 2 = 1/(100+2) = 0.0098
         let config_high_k = SearchConfig::default().with_rrf_k(100);
-        let results_high = reciprocal_rank_fusion(fts_results, Vec::new(), &config_high_k);
+        let results_high = reciprocal_rank_fusion(fts_results, Vec::new(), Vec::new(), &config_high_k);
 
         // With low k, the score difference is larger (relatively)
         let diff_low = results_low[0].score - results_low[1].score;
@@ -379,6 +444,7 @@ mod tests {
         assert!((config.min_score - 0.1).abs() < 0.001);
         assert!(config.use_fts);
         assert!(config.use_vector);
+        assert!(config.use_graph);
 
         let fts_only = SearchConfig::default().fts_only();
         assert!(fts_only.use_fts);
@@ -387,5 +453,10 @@ mod tests {
         let vector_only = SearchConfig::default().vector_only();
         assert!(!vector_only.use_fts);
         assert!(vector_only.use_vector);
+
+        let graph_only = SearchConfig::default().graph_only();
+        assert!(!graph_only.use_fts);
+        assert!(!graph_only.use_vector);
+        assert!(graph_only.use_graph);
     }
 }

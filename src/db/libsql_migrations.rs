@@ -12,7 +12,7 @@
 /// - `BYTEA` -> `BLOB`
 /// - `NUMERIC` -> `TEXT` (preserve precision for rust_decimal)
 /// - `TEXT[]` -> `TEXT` (JSON array)
-/// - `VECTOR(1536)` -> `F32_BLOB(1536)` (libsql native)
+/// - `VECTOR(1536)` -> `F32_BLOB(384)` (384d for local embeddings, configurable)
 /// - `TSVECTOR` -> FTS5 virtual table
 /// - `BIGSERIAL` -> `INTEGER PRIMARY KEY AUTOINCREMENT`
 /// - PL/pgSQL functions -> SQLite triggers
@@ -221,7 +221,7 @@ CREATE TABLE IF NOT EXISTS memory_chunks (
     document_id TEXT NOT NULL REFERENCES memory_documents(id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
     content TEXT NOT NULL,
-    embedding F32_BLOB(1536),
+    embedding F32_BLOB(384), -- Default dimension for local embeddings (GTE-small)
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (document_id, chunk_index)
 );
@@ -522,6 +522,26 @@ CREATE INDEX IF NOT EXISTS idx_routine_runs_status ON routine_runs(status);
 
 -- heartbeat_state
 CREATE INDEX IF NOT EXISTS idx_heartbeat_next_run ON heartbeat_state(next_run);
+
+-- ==================== Memory Graph ====================
+
+-- Memory edges for relationship tracking
+CREATE TABLE IF NOT EXISTS memory_edges (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    weight REAL NOT NULL,
+    metadata TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_edges_user ON memory_edges(user_id);
+CREATE INDEX IF NOT EXISTS idx_memory_edges_source ON memory_edges(user_id, source_id);
+CREATE INDEX IF NOT EXISTS idx_memory_edges_target ON memory_edges(user_id, target_id);
+CREATE INDEX IF NOT EXISTS idx_memory_edges_relation ON memory_edges(relation);
+CREATE INDEX IF NOT EXISTS idx_memory_edges_created ON memory_edges(created_at);
 
 -- ==================== Seed data ====================
 

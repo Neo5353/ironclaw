@@ -415,7 +415,8 @@ impl Repository {
             Vec::new()
         };
 
-        Ok(reciprocal_rank_fusion(fts_results, vector_results, config))
+        // TODO: Implement graph results in repository-level search
+        Ok(reciprocal_rank_fusion(fts_results, vector_results, Vec::new(), config))
     }
 
     /// Full-text search using PostgreSQL ts_rank_cd.
